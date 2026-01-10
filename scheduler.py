@@ -16,11 +16,9 @@ class ROLE:
 
 class ServiceScheduler:
     def __init__(self, df, year, month, preferences, discharge_dates):
-        # 1. 고정값 마스크 및 데이터 초기화
         self.fixed_mask = df.astype(str).replace(r'^\s*$', np.nan, regex=True).notna()
         self.schedule = df.copy()
         
-        # 전처리: 숫자 변환
         self.schedule = self.schedule.fillna("").astype(str)
         self.schedule = self.schedule.replace(r'^\s*$', np.nan, regex=True)
         self.schedule = self.schedule.apply(pd.to_numeric, errors='coerce')
@@ -35,13 +33,9 @@ class ServiceScheduler:
         self.preferences = preferences
         self.discharge_dates = discharge_dates
         
-        # 2. 목표 휴무일 계산
         self.total_month_holidays = self._count_holidays_in_range(1, self.num_days)
-        
-        # [수정 포인트] 키를 인덱스(0,1,2)가 아닌 이름('정다운')으로 저장해야 app.py에서 오류가 안 남
         self.agent_targets = {agent: self.total_month_holidays for agent in self.agents}
         
-        # 전역일 처리
         self._handle_discharge_logic()
 
     def _count_holidays_in_range(self, start_day, end_day):
@@ -58,85 +52,87 @@ class ServiceScheduler:
         return count
 
     def _handle_discharge_logic(self):
-        """전역일 로직: 목표 휴무일 계산"""
-        for agent in self.agents:
+        for n, agent in enumerate(self.agents):
             d_date = self.discharge_dates.get(agent, 0)
             if d_date and 0 < d_date < self.num_days:
+                self.schedule.iloc[n, d_date:] = ROLE.DISCHARGE
+                self.fixed_mask.iloc[n, d_date:] = True
                 holidays_after = self._count_holidays_in_range(d_date + 1, self.num_days)
                 new_target = self.total_month_holidays - holidays_after
-                # [수정 포인트] 이름으로 접근
                 self.agent_targets[agent] = max(0, new_target)
 
     def run(self):
-        # =====================================================================
-        # OR-Tools CP-SAT 모델링
-        # =====================================================================
         model = cp_model.CpModel()
-        
-        # 1. 변수 생성: shifts[(요원인덱스, 날짜)]
         shifts = {}
         for n in range(self.num_agents):
             for d in range(self.num_days):
                 shifts[(n, d)] = model.NewIntVar(0, 5, f'shift_n{n}_d{d}')
 
         # ---------------------------------------------------------------------
-        # 2. Hard Constraints (절대 어길 수 없는 규칙)
+        # 2. Hard Constraints (절대 규칙)
         # ---------------------------------------------------------------------
 
-        # (A) 사용자 고정값(Fixed Data) 반영
+        # (A) 값의 범위 및 고정값
         for n in range(self.num_agents):
             for d in range(self.num_days):
                 if self.fixed_mask.iloc[n, d]:
                     val = int(self.schedule.iloc[n, d])
                     if val == ROLE.UNAVAILABLE:
-                        model.Add(shifts[(n, d)].InDomain([ROLE.OFF_DUTY, ROLE.HOLIDAY]))
+                        model.AddLinearExpressionInDomain(shifts[(n, d)], cp_model.Domain.FromValues([ROLE.OFF_DUTY, ROLE.HOLIDAY]))
                     else:
                         model.Add(shifts[(n, d)] == val)
-                
-                # 전역일 이후 고정
-                agent_name = self.agents[n]
-                d_date = self.discharge_dates.get(agent_name, 0)
-                if d_date and 0 < d_date < self.num_days:
-                    if d >= d_date:
-                        model.Add(shifts[(n, d)] == ROLE.DISCHARGE)
+                else:
+                    # 빈칸: 0,1,2,3 만 가능 (4,5 불가)
+                    model.AddLinearExpressionInDomain(shifts[(n, d)], cp_model.Domain.FromValues([ROLE.DAY, ROLE.NIGHT, ROLE.OFF_DUTY, ROLE.HOLIDAY]))
 
-        # (B) 일일 근무 인원 제약
+        # (B) [핵심 수정] 근무 인원 제약 (주간/야간 모두 1~2명)
         for d in range(self.num_days):
             day_workers = []
+            night_workers = []
             for n in range(self.num_agents):
                 is_day = model.NewBoolVar(f'is_day_{n}_{d}')
                 model.Add(shifts[(n, d)] == ROLE.DAY).OnlyEnforceIf(is_day)
                 model.Add(shifts[(n, d)] != ROLE.DAY).OnlyEnforceIf(is_day.Not())
                 day_workers.append(is_day)
-            
-            night_workers = []
-            for n in range(self.num_agents):
+                
                 is_night = model.NewBoolVar(f'is_night_{n}_{d}')
                 model.Add(shifts[(n, d)] == ROLE.NIGHT).OnlyEnforceIf(is_night)
                 model.Add(shifts[(n, d)] != ROLE.NIGHT).OnlyEnforceIf(is_night.Not())
                 night_workers.append(is_night)
 
-            # [Hard] 최소 인원 보장
+            # 1. 주간 인원: 최소 1명 ~ 최대 2명
             model.Add(sum(day_workers) >= 1)
-            model.Add(sum(night_workers) >= 1)
+            model.Add(sum(day_workers) <= 2) 
             
-            # [Hard] 야간 최대 2명
+            # 2. 야간 인원: 최소 1명 ~ 최대 2명
+            model.Add(sum(night_workers) >= 1)
             model.Add(sum(night_workers) <= 2)
 
         # (C) 근무 패턴 제약
         for n in range(self.num_agents):
             for d in range(self.num_days):
-                is_night_today = model.NewBoolVar(f'is_night_today_{n}_{d}')
-                model.Add(shifts[(n, d)] == ROLE.NIGHT).OnlyEnforceIf(is_night_today)
-                model.Add(shifts[(n, d)] != ROLE.NIGHT).OnlyEnforceIf(is_night_today.Not())
+                is_night = model.NewBoolVar(f'is_n_{n}_{d}')
+                model.Add(shifts[(n, d)] == ROLE.NIGHT).OnlyEnforceIf(is_night)
+                model.Add(shifts[(n, d)] != ROLE.NIGHT).OnlyEnforceIf(is_night.Not())
+                
+                is_off = model.NewBoolVar(f'is_off_{n}_{d}')
+                model.Add(shifts[(n, d)] == ROLE.OFF_DUTY).OnlyEnforceIf(is_off)
+                model.Add(shifts[(n, d)] != ROLE.OFF_DUTY).OnlyEnforceIf(is_off.Not())
 
-                # 1. 야간(1) -> 다음날 비번(2)
+                # 야간 -> 비번
                 if d < self.num_days - 1:
-                    model.Add(shifts[(n, d+1)] == ROLE.OFF_DUTY).OnlyEnforceIf(is_night_today)
+                    model.Add(shifts[(n, d+1)] == ROLE.OFF_DUTY).OnlyEnforceIf(is_night)
 
-                # 2. 야-비-주(1-2-0) 원천 봉쇄
+                # 비번 -> 전날 야간
+                if d > 0:
+                    model.Add(shifts[(n, d-1)] == ROLE.NIGHT).OnlyEnforceIf(is_off)
+                else:
+                    if not self.fixed_mask.iloc[n, 0]:
+                        model.Add(shifts[(n, 0)] != ROLE.OFF_DUTY)
+
+                # 야-비-주 금지
                 if d < self.num_days - 2:
-                    model.Add(shifts[(n, d+2)] != ROLE.DAY).OnlyEnforceIf(is_night_today)
+                    model.Add(shifts[(n, d+2)] != ROLE.DAY).OnlyEnforceIf(is_night)
 
         # (D) 5일 연속 근무 제한
         for n in range(self.num_agents):
@@ -144,37 +140,40 @@ class ServiceScheduler:
                 is_works = []
                 for k in range(6):
                     is_work = model.NewBoolVar(f'work_{n}_{d+k}')
-                    model.AddLinearExpressionInDomain(
-                        shifts[(n, d+k)], cp_model.Domain.FromValues([ROLE.DAY, ROLE.NIGHT])
-                    ).OnlyEnforceIf(is_work)
-                    model.AddLinearExpressionInDomain(
-                        shifts[(n, d+k)], cp_model.Domain.FromIntervals([[2, 5]])
-                    ).OnlyEnforceIf(is_work.Not())
+                    model.AddLinearExpressionInDomain(shifts[(n, d+k)], cp_model.Domain.FromValues([ROLE.DAY, ROLE.NIGHT])).OnlyEnforceIf(is_work)
+                    model.AddLinearExpressionInDomain(shifts[(n, d+k)], cp_model.Domain.FromIntervals([[2, 5]])).OnlyEnforceIf(is_work.Not())
                     is_works.append(is_work)
-                
                 model.Add(sum(is_works) <= 5)
 
         # (E) 휴무 갯수 엄수
         for n in range(self.num_agents):
-            # [수정 포인트] 인덱스 n을 이름으로 변환하여 target 조회
             agent_name = self.agents[n]
             target = self.agent_targets[agent_name]
-            
             is_holidays = []
             for d in range(self.num_days):
                 is_hol = model.NewBoolVar(f'is_hol_{n}_{d}')
                 model.Add(shifts[(n, d)] == ROLE.HOLIDAY).OnlyEnforceIf(is_hol)
                 model.Add(shifts[(n, d)] != ROLE.HOLIDAY).OnlyEnforceIf(is_hol.Not())
                 is_holidays.append(is_hol)
-            
             model.Add(sum(is_holidays) == target)
 
         # ---------------------------------------------------------------------
-        # 3. Soft Constraints (Objectives: 벌점 최소화)
+        # 3. Soft Constraints (벌점 최소화)
         # ---------------------------------------------------------------------
         penalties = []
 
-        # (A) 야-비-야-비 패턴 방지
+        # (A) [핵심 수정] 야간 우선 배정 (주간 근무에 페널티 부여)
+        # 주간 근무를 서면 벌점을 주어, 가능한 야간(벌점 0)으로 유도함
+        for n in range(self.num_agents):
+            for d in range(self.num_days):
+                is_day = model.NewBoolVar(f'penalty_day_{n}_{d}')
+                model.Add(shifts[(n, d)] == ROLE.DAY).OnlyEnforceIf(is_day)
+                model.Add(shifts[(n, d)] != ROLE.DAY).OnlyEnforceIf(is_day.Not())
+                
+                # 주간 근무 1회당 벌점 10점 (상당히 높게 주어 야간 선호를 강제)
+                penalties.append(is_day * 10)
+
+        # (B) 야-비-야-비 패턴 방지
         for n in range(self.num_agents):
             for d in range(self.num_days - 2):
                 is_bad_pattern = model.NewBoolVar(f'bad_pat_{n}_{d}')
@@ -192,9 +191,9 @@ class ServiceScheduler:
                 model.AddBoolAnd([s1, s2, s3]).OnlyEnforceIf(is_bad_pattern)
                 model.AddBoolOr([s1.Not(), s2.Not(), s3.Not()]).OnlyEnforceIf(is_bad_pattern.Not())
                 
-                penalties.append(is_bad_pattern * 100)
+                penalties.append(is_bad_pattern * 100) # 패턴 방지는 100점 (가장 중요)
 
-        # (B) 선호도 반영
+        # (C) 선호도 반영
         for n, agent in enumerate(self.agents):
             pref = self.preferences.get(agent, "")
             for d in range(self.num_days):
@@ -202,12 +201,12 @@ class ServiceScheduler:
                     is_day = model.NewBoolVar(f'pref_d_{n}_{d}')
                     model.Add(shifts[(n, d)] == ROLE.DAY).OnlyEnforceIf(is_day)
                     model.Add(shifts[(n, d)] != ROLE.DAY).OnlyEnforceIf(is_day.Not())
-                    penalties.append(is_day.Not() * 1)
+                    penalties.append(is_day.Not() * 5) # 선호도 무시는 5점
                 elif pref == "야간 선호":
                     is_night = model.NewBoolVar(f'pref_n_{n}_{d}')
                     model.Add(shifts[(n, d)] == ROLE.NIGHT).OnlyEnforceIf(is_night)
                     model.Add(shifts[(n, d)] != ROLE.NIGHT).OnlyEnforceIf(is_night.Not())
-                    penalties.append(is_night.Not() * 1)
+                    penalties.append(is_night.Not() * 5)
 
         # ---------------------------------------------------------------------
         # 4. Solve
@@ -226,7 +225,7 @@ class ServiceScheduler:
             final_df = self._convert_to_text(self.schedule)
             return True, final_df, f"최적화 완료! (목표 휴무 정확히 준수)"
         else:
-            return False, None, "조건을 만족하는 해를 찾을 수 없습니다. (입력 조건 충돌)"
+            return False, None, "조건을 만족하는 해를 찾을 수 없습니다. (제약조건이 충돌합니다. 인원수를 조정하거나 고정값을 확인하세요.)"
 
     def _convert_to_text(self, df):
         mapping = {0: '주', 1: '야', 2: '비', 3: '휴', 4: '불', 5: '교'}
