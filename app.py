@@ -125,10 +125,10 @@ def step2_constraints():
              st.session_state.schedule_df.columns = date_columns
              st.session_state.schedule_df = st.session_state.schedule_df.astype(str).replace('nan', '')
 
-    st.info("**입력 가이드:** 0:주 | 1:야 | 2:비 | 3:휴 | 4:불가 | 5:교육 (빈칸: 자동)")
+    st.info("**입력 가이드:** 0:주 | 1:야 | 2:비 | 3:휴 | 4:불가 | 5:교육 (빈칸: 자동) | 6:주간불가 | 7:야간불가")
     
     column_config_settings = {
-        col: st.column_config.TextColumn(col, width="small", validate="^[0-5]?$") 
+        col: st.column_config.TextColumn(col, width="small", validate="^[0-7]?$") 
         for col in date_columns
     }
 
